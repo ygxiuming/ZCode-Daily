@@ -1,11 +1,9 @@
 name: ZCode Daily
 
 on:
-  # 上游仓库默认不跑定时，避免空跑。
-  # fork 后想启用定时：把下面两行取消注释（cron 用 UTC，北京时间 = UTC+8）。
-  # 北京时间 每天 08:25
-  # schedule:
-  #   - cron: "25 0 * * *"
+  schedule:
+    # cron 用 UTC，北京时间 = UTC+8。北京时间 每天 08:25
+    - cron: "25 0 * * *"
   workflow_dispatch:
 
 permissions:
@@ -21,6 +19,7 @@ jobs:
     timeout-minutes: 20
     env:
       TZ: Asia/Shanghai
+      ZCODE_APP_VERSION: "3.18.2"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,7 +40,9 @@ jobs:
           WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
           DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
-        run: python zcode_cn_daily.py
+        run: |
+          set -o pipefail
+          python zcode_cn_daily.py 2>&1 | tee cn.log
 
       - name: Run ZCode INTL
         env:
@@ -51,5 +52,63 @@ jobs:
           WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
           DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
-        run: python zcode_intl_daily.py
+        run: |
+          set -o pipefail
+          python zcode_intl_daily.py 2>&1 | tee intl.log
 
+      # 不管成功失败都把日志邮件发到指定邮箱
+      - name: Send report email
+        if: always()
+        env:
+          QQ_SMTP_AUTH_CODE: ${{ secrets.QQ_SMTP_AUTH_CODE }}
+          QQ_MAIL_FROM: ${{ secrets.QQ_MAIL_FROM }}
+          QQ_MAIL_TO: ${{ secrets.QQ_MAIL_TO }}
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 <<'PYEOF'
+          import os
+          import smtplib
+          import ssl
+          from email.header import Header
+          from email.mime.text import MIMEText
+          from email.utils import formataddr
+
+          auth_code = os.environ.get("QQ_SMTP_AUTH_CODE", "").strip()
+          mail_from = os.environ.get("QQ_MAIL_FROM", "").strip()
+          mail_to = os.environ.get("QQ_MAIL_TO", "").strip()
+          job_status = os.environ.get("JOB_STATUS", "unknown")
+          run_url = os.environ.get("RUN_URL", "")
+
+          if not (auth_code and mail_from and mail_to):
+              print("warning: 邮件配置缺失（QQ_SMTP_AUTH_CODE / QQ_MAIL_FROM / QQ_MAIL_TO），跳过发送")
+              raise SystemExit(0)
+
+          status_map = {
+              "success": "成功",
+              "failure": "失败",
+              "cancelled": "已取消",
+          }
+          status_text = status_map.get(job_status, job_status)
+
+          sections = []
+          for name, path in (("国内版", "cn.log"), ("国际版", "intl.log")):
+              if os.path.exists(path):
+                  with open(path, encoding="utf-8", errors="replace") as fh:
+                      content = fh.read().strip()
+                  if content:
+                      sections.append("===== %s 日志 =====\n%s" % (name, content))
+          body = "\n\n".join(sections) or "（本次运行没有产出日志）"
+          body += "\n\n状态: %s\n查看完整运行日志: %s" % (status_text, run_url)
+
+          message = MIMEText(body, "plain", "utf-8")
+          message["Subject"] = Header("ZCode Daily 领取报告 - %s" % status_text, "utf-8")
+          message["From"] = formataddr((str(Header("ZCode Daily", "utf-8")), mail_from))
+          message["To"] = mail_to
+
+          context = ssl.create_default_context()
+          with smtplib.SMTP_SSL("smtp.qq.com", 465, context=context) as server:
+              server.login(mail_from, auth_code)
+              server.sendmail(mail_from, [mail_to], message.as_string())
+          print("报告邮件已发送至 %s" % mail_to)
+          PYEOF

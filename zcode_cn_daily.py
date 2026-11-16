@@ -75,9 +75,20 @@ MARKETING_MAX_DEPTH = 12
 MARKETING_MAX_NODES = 4096
 MARKETING_MAX_DELIVERIES = 32
 MARKETING_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
-DEVICE_STORE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zcode_cn_devices.json")
+def _data_file_path(filename):
+    # 数据文件固定落在脚本所在目录内；显式校验拼接结果未逃逸目录，防止路径穿越
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    candidate = os.path.abspath(os.path.join(base_dir, filename))
+    if candidate != base_dir and not candidate.startswith(base_dir + os.sep):
+        raise ValueError("data file path escapes script dir: %r" % (filename,))
+    return candidate
+
+
+DEVICE_STORE_NAME = "zcode_cn_devices.json"
+DEVICE_STORE = _data_file_path(DEVICE_STORE_NAME)
 REGION = "cn"
-CLAIM_LEDGER_STORE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zcode_cn_claim_ledger.json")
+CLAIM_LEDGER_NAME = "zcode_cn_claim_ledger.json"
+CLAIM_LEDGER_STORE = _data_file_path(CLAIM_LEDGER_NAME)
 CLAIM_LEDGER_VERSION = 1
 CLAIM_LEDGER_RETENTION_SECONDS = 90 * 24 * 60 * 60
 
@@ -181,9 +192,16 @@ def load_device_store():
 
 
 def save_device_store(store):
+    # 以脚本目录为 dir_fd 锚点写文件：文件名不含路径分隔符，内核层面杜绝路径穿越
     try:
-        with open(DEVICE_STORE, "w", encoding="utf-8") as handle:
-            json.dump(store, handle, ensure_ascii=False, indent=2)
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        dir_fd = os.open(base_dir, os.O_RDONLY)
+        try:
+            fd = os.open(DEVICE_STORE_NAME, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600, dir_fd=dir_fd)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(store, handle, ensure_ascii=False, indent=2)
+        finally:
+            os.close(dir_fd)
     except Exception:
         pass
 
@@ -271,22 +289,32 @@ def _normalize_claim_ledger(raw, now):
 
 
 def save_claim_ledger(ledger):
+    # 以脚本目录为 dir_fd 锚点写临时文件再原子替换：文件名不含路径分隔符，杜绝路径穿越
     directory = os.path.dirname(os.path.abspath(CLAIM_LEDGER_STORE))
-    temp_path = "%s.%s.tmp" % (CLAIM_LEDGER_STORE, uuid.uuid4().hex)
+    temp_name = ".claim-ledger.%s.tmp" % uuid.uuid4().hex
+    dir_fd = None
     try:
         os.makedirs(directory, exist_ok=True)
-        with open(temp_path, "w", encoding="utf-8") as handle:
+        dir_fd = os.open(directory, os.O_RDONLY)
+        fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600, dir_fd=dir_fd)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(ledger, handle, ensure_ascii=False, indent=2)
             handle.write("\n")
-        os.replace(temp_path, CLAIM_LEDGER_STORE)
+        os.replace(temp_name, CLAIM_LEDGER_NAME, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
         return True, ""
     except Exception as error:
         try:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+            if dir_fd is not None:
+                os.unlink(temp_name, dir_fd=dir_fd)
         except OSError:
             pass
         return False, str(error)
+    finally:
+        if dir_fd is not None:
+            try:
+                os.close(dir_fd)
+            except OSError:
+                pass
 
 
 def load_claim_ledger():
